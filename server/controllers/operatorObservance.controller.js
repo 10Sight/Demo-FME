@@ -1,0 +1,400 @@
+import OperatorObservance from "../models/operatorObservance.model.js";
+import CourseLevelConfig from "../models/courseLevelConfig.model.js";
+import { executeQuery } from "../db/mssqlHelper.js";
+import { ApiError } from "../utils/ApiError.js";
+import { ApiResponse } from "../utils/ApiResponse.js";
+import { asyncHandler } from "../utils/asyncHandler.js";
+import NotificationService from "../services/notification.service.js";
+import logAudit from "../utils/auditLogger.js";
+import RevisionRecordService from "../services/revisionRecord.service.js";
+import { addMonthsToDateValue } from "../utils/dateMath.js";
+
+const normalizeLevel = (level) => String(level || "").replace(/[^a-zA-Z0-9]/g, "").toUpperCase();
+
+const getDerivedLevel1CompletionDate = async (studentId) => {
+    const activeConfig = await CourseLevelConfig.getActiveConfig();
+    const levels = [...(activeConfig?.levels || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+    // Fetch the 1st active level (index 0)
+    const firstLevelName = levels[0]?.name;
+    if (!firstLevelName) return null;
+
+    const [progressRows] = await executeQuery(
+        "SELECT currentLevel, levelStartDate, updatedAt, createdAt FROM progress WHERE student = ?",
+        [studentId]
+    );
+
+    const targetNorm = normalizeLevel(firstLevelName);
+    const matchedProgress = (progressRows || [])
+        .filter((row) => normalizeLevel(row.currentLevel) === targetNorm)
+        .map((row) => row.levelStartDate || row.updatedAt || row.createdAt)
+        .filter(Boolean)
+        .sort((a, b) => new Date(b) - new Date(a))[0];
+
+    if (matchedProgress) return matchedProgress;
+
+    // Fallback: use skill-upgradation certificate date for that level.
+    const [certRows] = await executeQuery(
+        `SELECT TOP 1 issueDate, createdAt
+         FROM certificates
+         WHERE student = ? AND type = 'SKILL_UPGRADATION' AND level = ?
+         ORDER BY issueDate DESC, createdAt DESC`,
+        [String(studentId), firstLevelName]
+    );
+
+    if (certRows.length > 0) return certRows[0].issueDate || certRows[0].createdAt || null;
+
+    return null;
+};
+
+const getDerivedLevel2CompletionDate = async (studentId) => {
+    const activeConfig = await CourseLevelConfig.getActiveConfig();
+    const levels = [...(activeConfig?.levels || [])].sort((a, b) => (a.order ?? 0) - (b.order ?? 0));
+
+    // Fetch the 2nd active level (index 1)
+    const secondLevelName = levels[1]?.name;
+    if (!secondLevelName) return null;
+
+    const [progressRows] = await executeQuery(
+        "SELECT currentLevel, levelStartDate, updatedAt, createdAt FROM progress WHERE student = ?",
+        [studentId]
+    );
+
+    const targetNorm = normalizeLevel(secondLevelName);
+    const matchedProgress = (progressRows || [])
+        .filter((row) => normalizeLevel(row.currentLevel) === targetNorm)
+        .map((row) => row.levelStartDate || row.updatedAt || row.createdAt)
+        .filter(Boolean)
+        .sort((a, b) => new Date(b) - new Date(a))[0];
+
+    if (matchedProgress) return matchedProgress;
+
+    // Fallback: use skill-upgradation certificate date for that level.
+    const [certRows] = await executeQuery(
+        `SELECT TOP 1 issueDate, createdAt
+         FROM certificates
+         WHERE student = ? AND type = 'SKILL_UPGRADATION' AND level = ?
+         ORDER BY issueDate DESC, createdAt DESC`,
+        [String(studentId), secondLevelName]
+    );
+
+    if (certRows.length > 0) return certRows[0].issueDate || certRows[0].createdAt || null;
+
+    return null;
+};
+
+// Helper to resolve studentId (from ID, userName, empId or slug)
+const resolveStudentId = async (studentId) => {
+    if (!studentId) return null;
+    let users;
+    if (!isNaN(studentId) && !isNaN(parseFloat(studentId))) {
+        [users] = await executeQuery("SELECT id FROM users WHERE id = ?", [studentId]);
+        if (users.length > 0) return users[0].id;
+    }
+    [users] = await executeQuery("SELECT id FROM users WHERE userName = ? OR slug = ? OR empId = ?", [studentId, studentId, studentId]);
+    return users.length > 0 ? users[0].id : null;
+};
+
+// Same row ids as CHECK_CONTENTS in OperatorObservanceSheet.jsx (frontend)
+const CHECK_ROW_IDS = [
+    "workingManner",
+    "cycleTime",
+    "checkSheets",
+    "processProductAwareness",
+    "pastCustomerClaim",
+    "checkedByLine",
+    "verificationByShift"
+];
+const OBS_COLUMNS = ["obs1", "obs2", "obs3", "obs4"];
+const ORDINALS = ["1st", "2nd", "3rd", "4th"];
+
+const isCellFilled = (cell) => {
+    if (!cell) return false;
+    return String(cell.status || "").trim() !== "" || String(cell.val || "").trim() !== "";
+};
+
+const isCellComplete = (cell) => {
+    if (!cell) return false;
+    return String(cell.status || "").trim() !== "" && String(cell.val || "").trim() !== "";
+};
+
+// "Started" must reflect actual inspection work, not just a date being present — obs1-4's
+// 1st-Time date can now be auto-populated (Level-1/2 completion date + 1/2 months) before the
+// operator has been inspected even once, so date-alone can no longer count as "started".
+const isSubColumnStarted = (data, colId) =>
+    CHECK_ROW_IDS.some((rowId) => isCellFilled(data?.[rowId]?.[colId]));
+
+const isSubColumnComplete = (data, colId) => {
+    const date = data?.columnDates?.[colId];
+    if (!date || String(date).trim() === "") return false;
+    return CHECK_ROW_IDS.every((rowId) => isCellComplete(data?.[rowId]?.[colId]));
+};
+
+// obs1/obs2 auto-schedule off Level-1 completion (+1/+2 months); obs3/obs4 off Level-2
+// (+1/+2 months). Mirrored by OperatorObservanceSheet.jsx for live client-side pre-fill.
+const deriveObservanceColumnDates = (level1Date, level2Date) => ({
+    obs1: addMonthsToDateValue(level1Date, 1),
+    obs2: addMonthsToDateValue(level1Date, 2),
+    obs3: addMonthsToDateValue(level2Date, 1),
+    obs4: addMonthsToDateValue(level2Date, 2),
+});
+
+// Fills obs1-4's 1st-Time date only where missing — never overwrites a value already present
+// (a manually chosen or client-supplied date always wins over the derived suggestion).
+const withDerivedColumnDates = (observanceData, level1Date, level2Date) => {
+    const derived = deriveObservanceColumnDates(level1Date, level2Date);
+    const columnDates = { ...(observanceData?.columnDates || {}) };
+    for (const key of Object.keys(derived)) {
+        if (!columnDates[key] && derived[key]) columnDates[key] = derived[key];
+    }
+    return { ...(observanceData || {}), columnDates };
+};
+
+// Mirrors client-side validation in OperatorObservanceSheet.jsx
+const validateObservanceData = (observanceData) => {
+    const data = observanceData || {};
+
+    const anyDateFilled = Object.values(data.columnDates || {}).some((d) => d && String(d).trim() !== "");
+    const anyRowFilled = CHECK_ROW_IDS.some((rowId) =>
+        OBS_COLUMNS.some((col) => isCellFilled(data?.[rowId]?.[col]) || isCellFilled(data?.[rowId]?.[`${col}Re`]))
+    );
+    if (!anyDateFilled && !anyRowFilled) {
+        return "Please fill at least one observance before saving.";
+    }
+
+    for (let i = 0; i < OBS_COLUMNS.length; i++) {
+        const col = OBS_COLUMNS[i];
+        const colRe = `${col}Re`;
+        const ordinal = ORDINALS[i];
+
+        const primaryStarted = isSubColumnStarted(data, col) || isSubColumnStarted(data, colRe);
+        if (primaryStarted && !isSubColumnComplete(data, col)) {
+            return `${ordinal} Observance: Please select the 1st Time date and fill OK/NG status with result description for all check content rows before saving.`;
+        }
+
+        const reStarted = isSubColumnStarted(data, colRe);
+        if (reStarted && !isSubColumnComplete(data, colRe)) {
+            return `${ordinal} Observance: You have started the Reinspect column — please select the reinspection date and fill OK/NG status with result description for all check content rows before saving.`;
+        }
+    }
+
+    return null;
+};
+
+// Determines which observance column (1st..6th Observance) the operator is currently on,
+// based on whether every check-content row has a status recorded for that column.
+const computeCurrentStage = (observanceData) => {
+    if (!observanceData) return { stageLabel: "Not Started", stageIndex: 0 };
+
+    for (let i = 0; i < OBS_COLUMNS.length; i++) {
+        const colId = OBS_COLUMNS[i];
+        const allFilled = CHECK_ROW_IDS.every((rowId) => {
+            const cell = observanceData?.[rowId]?.[colId];
+            return cell && String(cell.status || "").trim() !== "";
+        });
+        if (!allFilled) {
+            const anyFilled = CHECK_ROW_IDS.some((rowId) => {
+                const cell = observanceData?.[rowId]?.[colId];
+                return cell && (String(cell.status || "").trim() !== "" || String(cell.val || "").trim() !== "");
+            });
+            return {
+                stageLabel: `${ORDINALS[i]} Observance${anyFilled ? " (In Progress)" : ""}`,
+                stageIndex: i + 1
+            };
+        }
+    }
+    return { stageLabel: "Completed", stageIndex: OBS_COLUMNS.length };
+};
+
+export const getObservanceSummary = asyncHandler(async (req, res) => {
+    const studentIds = String(req.query.studentIds || "")
+        .split(",")
+        .map((id) => id.trim())
+        .filter((id) => id && !isNaN(id));
+
+    if (studentIds.length === 0) {
+        return res.json(new ApiResponse(200, {}, "No student IDs provided"));
+    }
+
+    const placeholders = studentIds.map(() => "?").join(",");
+    const [rows] = await executeQuery(
+        `SELECT studentId, observanceData, status, updatedAt FROM operator_observances WHERE studentId IN (${placeholders})`,
+        studentIds
+    );
+
+    const summary = {};
+    for (const row of rows) {
+        let observanceData = {};
+        try {
+            observanceData = typeof row.observanceData === "string" ? JSON.parse(row.observanceData) : (row.observanceData || {});
+        } catch (e) {
+            observanceData = {};
+        }
+        const { stageLabel, stageIndex } = computeCurrentStage(observanceData);
+        summary[row.studentId] = {
+            status: row.status || "Draft",
+            updatedAt: row.updatedAt,
+            stageLabel,
+            stageIndex
+        };
+    }
+
+    res.json(new ApiResponse(200, summary, "Observance summary fetched"));
+});
+
+export const getObservanceByStudent = asyncHandler(async (req, res) => {
+    const { studentId } = req.params;
+    if (!studentId) throw new ApiError("Student ID is required", 400);
+
+    const resolvedId = await resolveStudentId(studentId);
+    if (!resolvedId) throw new ApiError("Student not found", 404);
+
+    const observance = await OperatorObservance.findByStudentId(resolvedId);
+    const derivedLevel1Date = await getDerivedLevel1CompletionDate(resolvedId);
+    const derivedLevel2Date = await getDerivedLevel2CompletionDate(resolvedId);
+
+    logAudit(req.user?.id, "VIEW_OPERATOR_OBSERVANCE_SHEET",
+        { studentId: resolvedId, operatorNameCode: observance?.operatorNameCode || "" },
+        { resourceType: "OperatorObservance", resourceId: resolvedId, req }
+    ).catch(err => console.error("logAudit(VIEW_OPERATOR_OBSERVANCE_SHEET) failed:", err.message));
+
+    // If no record exists, return an empty structure so frontend can initialize
+    if (!observance) {
+        return res.json(new ApiResponse(200, { isNew: true, studentId: resolvedId, level1Date: derivedLevel1Date, level2Date: derivedLevel2Date, preparedBy: "", checkedBy: "", verifiedBy: "", status: "Draft" }, "No existing observance record"));
+    }
+
+    const responseData = {
+        ...observance,
+        level1Date: observance.level1Date || derivedLevel1Date || null,
+        level2Date: observance.level2Date || derivedLevel2Date || null,
+        preparedBy: observance.preparedBy || "",
+        checkedBy: observance.checkedBy || "",
+        verifiedBy: observance.verifiedBy || "",
+        status: observance.status || "Draft",
+    };
+
+    res.json(new ApiResponse(200, responseData, "Observance record fetched"));
+});
+
+export const createOrUpdateObservance = asyncHandler(async (req, res) => {
+    const { studentId } = req.params;
+    const data = req.body;
+
+    if (!studentId) throw new ApiError("Student ID is required", 400);
+
+    const resolvedId = await resolveStudentId(studentId);
+    if (!resolvedId) throw new ApiError("Student not found", 404);
+
+    const derivedLevel1Date = await getDerivedLevel1CompletionDate(resolvedId);
+    const finalLevel1Date = data.level1Date || derivedLevel1Date || null;
+    const derivedLevel2Date = await getDerivedLevel2CompletionDate(resolvedId);
+    const finalLevel2Date = data.level2Date || derivedLevel2Date || null;
+    const userSavingName = req.user?.fullName || req.user?.name || "System";
+
+    // Fill obs1-4's 1st-Time date from Level-1/2 dates wherever the caller left it blank,
+    // then validate the data that will actually be persisted (not the raw payload) — the
+    // client normally pre-fills these itself, but this keeps direct API callers and any
+    // race against the same guarantee, and is what Excel export ultimately reads back.
+    const observanceDataToSave = withDerivedColumnDates(data.observanceData, finalLevel1Date, finalLevel2Date);
+
+    const validationError = validateObservanceData(observanceDataToSave);
+    if (validationError) throw new ApiError(validationError, 400);
+
+    let observance = await OperatorObservance.findByStudentId(resolvedId);
+
+    if (observance) {
+        const previousStatus = observance.status;
+        const previousCheckedBy = observance.checkedBy || "";
+        const previousVerifiedBy = observance.verifiedBy || "";
+
+        // Update existing
+        observance.lineName = data.lineName;
+        observance.processName = data.processName;
+        observance.level1Date = finalLevel1Date;
+        observance.level2Date = finalLevel2Date;
+        observance.operatorNameCode = data.operatorNameCode;
+        observance.observanceData = observanceDataToSave;
+        observance.checkedBy = data.checkedBy || "";
+        observance.verifiedBy = data.verifiedBy || "";
+        observance.preparedBy = data.preparedBy || observance.preparedBy || userSavingName;
+        observance.status = data.status || "Draft";
+        if (data.revHistory) observance.revHistory = data.revHistory;
+
+
+        await observance.save();
+
+        const auditAction = observance.status === "Submitted" && previousStatus !== "Submitted"
+            ? "SUBMIT_OPERATOR_OBSERVANCE_SHEET"
+            : "SAVE_OPERATOR_OBSERVANCE_SHEET_DRAFT";
+        logAudit(req.user?.id, auditAction,
+            { studentId: resolvedId, lineName: observance.lineName, processName: observance.processName, preparedBy: observance.preparedBy },
+            { resourceType: "OperatorObservance", resourceId: resolvedId, req }
+        ).catch(err => console.error(`logAudit(${auditAction}) failed:`, err.message));
+
+        if (observance.checkedBy && observance.checkedBy !== previousCheckedBy) {
+            logAudit(req.user?.id, "CHECK_OPERATOR_OBSERVANCE_SHEET",
+                { studentId: resolvedId, lineName: observance.lineName, processName: observance.processName, checkedBy: observance.checkedBy, action: observance.checkedBy.startsWith("Approved") ? "Approved" : "Rejected" },
+                { resourceType: "OperatorObservance", resourceId: resolvedId, req }
+            ).catch(err => console.error("logAudit(CHECK_OPERATOR_OBSERVANCE_SHEET) failed:", err.message));
+        }
+
+        if (observance.verifiedBy && observance.verifiedBy !== previousVerifiedBy) {
+            logAudit(req.user?.id, "VERIFY_OPERATOR_OBSERVANCE_SHEET",
+                { studentId: resolvedId, lineName: observance.lineName, processName: observance.processName, verifiedBy: observance.verifiedBy, action: observance.verifiedBy.startsWith("Approved") ? "Approved" : "Rejected" },
+                { resourceType: "OperatorObservance", resourceId: resolvedId, req }
+            ).catch(err => console.error("logAudit(VERIFY_OPERATOR_OBSERVANCE_SHEET) failed:", err.message));
+        }
+
+        // Trigger Email Notification only if status is Submitted
+        if (data.status === "Submitted") {
+            NotificationService.sendFormReport("Operator Observance Check Sheet", null, req.body, resolvedId)
+                .catch(err => console.error("[Observance] Notification failed:", err));
+        }
+
+        res.json(new ApiResponse(200, observance, "Observance record updated"));
+    } else {
+        // Create new — freeze whatever the Revision Table currently says for this
+        // form; the update branch above never touches these columns. This model has
+        // no department/section of its own, so resolve the student's current
+        // assignment (frozen at creation, same as everything else here).
+        const [studentRows] = await executeQuery("SELECT departmentId, sectionId FROM users WHERE id = ?", [resolvedId]);
+        const student = studentRows[0] || {};
+
+        if (student.sectionId) {
+            const [secs] = await executeQuery("SELECT hideOperatorObservance FROM [sections] WHERE id = ?", [student.sectionId]);
+            if (secs.length > 0 && (secs[0].hideOperatorObservance === true || secs[0].hideOperatorObservance === 1)) {
+                throw new ApiError("The Operator Observance sheet is disabled for this student's section", 403);
+            }
+        }
+
+        const revision = await RevisionRecordService.getLatestForSheet('operator-observance', student.departmentId || null, student.sectionId || null);
+
+        const newRecord = await OperatorObservance.create({
+            studentId: resolvedId,
+            ...data,
+            observanceData: observanceDataToSave,
+            level1Date: finalLevel1Date,
+            level2Date: finalLevel2Date,
+            preparedBy: data.preparedBy || userSavingName,
+            checkedBy: data.checkedBy || "",
+            verifiedBy: data.verifiedBy || "",
+            status: data.status || "Draft",
+            docNo: revision?.docNo,
+            revNo: revision?.revNo,
+            revDate: revision?.revDate,
+        });
+
+        logAudit(req.user?.id, "CREATE_OPERATOR_OBSERVANCE_SHEET",
+            { studentId: resolvedId, lineName: newRecord.lineName, processName: newRecord.processName, status: newRecord.status },
+            { resourceType: "OperatorObservance", resourceId: resolvedId, req }
+        ).catch(err => console.error("logAudit(CREATE_OPERATOR_OBSERVANCE_SHEET) failed:", err.message));
+
+        // Trigger Email Notification only if status is Submitted
+        if (data.status === "Submitted") {
+            NotificationService.sendFormReport("Operator Observance Check Sheet", null, req.body, resolvedId)
+                .catch(err => console.error("[Observance] Notification failed:", err));
+        }
+
+        res.status(201).json(new ApiResponse(201, newRecord, "Observance record created"));
+    }
+});

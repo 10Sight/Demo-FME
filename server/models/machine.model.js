@@ -1,0 +1,289 @@
+import { executeQuery } from "../db/mssqlHelper.js";
+import migrationHelper from "../db/migrationHelper.js";
+import logger from "../logger/winston.logger.js";
+import { getDesignationShutterExclusionSql } from "../utils/userEligibility.js";
+
+const machineCountSql = (machineAlias = "m") => `
+    (SELECT COUNT(*)
+     FROM users u
+     WHERE (u.isDeleted = 0 OR u.isDeleted IS NULL)
+       AND (u.isTemporary = 0 OR u.isTemporary IS NULL)
+       AND u.status = 'PRESENT'
+       ${getDesignationShutterExclusionSql("u")}
+       AND (
+           u.stationId = ${machineAlias}.id
+           OR EXISTS (
+               SELECT 1 FROM machine_assignments ma
+               WHERE ma.user_id = u.id AND ma.machine_id = ${machineAlias}.id
+           )
+       )
+    ) as machineCount
+`;
+
+class Machine {
+    constructor(data) {
+        this.id = data.id;
+        this._id = data.id; // Compatibility
+
+        this.name = data.name;
+        this.line = data.line;
+        this.subSectionId = data.subSectionId || null;
+        this.description = data.description;
+        this.criticality = data.criticality || 'Non-Critical';
+        this.isActive = data.isActive !== undefined ? !!data.isActive : true;
+        this.machineCount = data.machineCount || 0;
+
+        this.createdAt = data.createdAt;
+        this.updatedAt = data.updatedAt;
+    }
+
+    static async asyncExecute(query, params = []) {
+        try {
+            return await executeQuery(query, params);
+        } catch (error) {
+            logger.error(`Database error: ${error.message}`, { query, params });
+            // Don't throw for cleanup errors to allow init to proceed
+            return [[]];
+        }
+    }
+
+    static async init() {
+        try {
+            logger.info("Initializing Machine table and cleaning up schema...");
+
+            // 1. Identify and drop unique constraints
+            const [constraints] = await this.asyncExecute(`
+                SELECT name 
+                FROM sys.key_constraints 
+                WHERE type = 'UQ' AND parent_object_id = OBJECT_ID('machines')
+            `);
+            for (const constraint of constraints) {
+                logger.info(`Dropping unique constraint: ${constraint.name}`);
+                await this.asyncExecute(`ALTER TABLE machines DROP CONSTRAINT [${constraint.name}]`);
+            }
+
+            // 2. Identify and drop unique indexes
+            const [indexes] = await this.asyncExecute(`
+                SELECT name 
+                FROM sys.indexes 
+                WHERE is_unique = 1 AND object_id = OBJECT_ID('machines') AND is_primary_key = 0
+            `);
+            for (const index of indexes) {
+                logger.info(`Dropping unique index: ${index.name}`);
+                await this.asyncExecute(`DROP INDEX [${index.name}] ON machines`);
+            }
+
+            // 3. Drop uniCode column if it exists
+            const [columns] = await this.asyncExecute(`
+                SELECT name FROM sys.columns 
+                WHERE object_id = OBJECT_ID('machines') AND name = 'uniCode'
+            `);
+            if (columns.length > 0) {
+                logger.info("Dropping uniCode column from machines");
+                await this.asyncExecute("ALTER TABLE machines DROP COLUMN [uniCode]");
+            }
+
+            if (!await migrationHelper.tableExists('machines')) {
+                await executeQuery(`
+                    CREATE TABLE machines (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        name NVARCHAR(255) NOT NULL,
+                        line INT NOT NULL,
+                        subSectionId INT NOT NULL,
+                        description NVARCHAR(MAX),
+                        minimumRequiredLevel NVARCHAR(50),
+                        criticality NVARCHAR(50) DEFAULT 'Non-Critical',
+                        isActive BIT DEFAULT 1,
+                        createdAt DATETIME DEFAULT GETDATE(),
+                        updatedAt DATETIME DEFAULT GETDATE(),
+                        FOREIGN KEY (subSectionId) REFERENCES [sub_sections](id) ON DELETE CASCADE
+                    )
+                `);
+                await migrationHelper.ensureIndexExists('machines', 'idx_line', 'CREATE INDEX idx_line ON machines(line)');
+                await migrationHelper.ensureIndexExists('machines', 'idx_subsection', 'CREATE INDEX idx_subsection ON machines(subSectionId)');
+            } else {
+                // Migration: Add minimumRequiredLevel if it doesn't exist
+                await migrationHelper.ensureColumnExists('machines', 'minimumRequiredLevel', 'NVARCHAR(50)');
+
+                // Migration: Add criticality if it doesn't exist
+                await migrationHelper.ensureColumnExists('machines', 'criticality', "NVARCHAR(50) DEFAULT 'Non-Critical'");
+
+                // Migration: Check if subSectionId points to lines instead of sub_sections
+                await executeQuery(`
+                    IF EXISTS (
+                        SELECT *
+                        FROM sys.foreign_key_columns fkc
+                        JOIN sys.columns c ON fkc.parent_object_id = c.object_id AND fkc.parent_column_id = c.column_id
+                        JOIN sys.tables t ON fkc.referenced_object_id = t.object_id
+                        WHERE OBJECT_NAME(fkc.parent_object_id) = 'machines'
+                        AND c.name = 'subSectionId'
+                        AND t.name = 'lines'
+                    )
+                    BEGIN
+                        -- Find the constraint name
+                        DECLARE @ConstraintName NVARCHAR(255);
+                        SELECT @ConstraintName = OBJECT_NAME(fkc.constraint_object_id)
+                        FROM sys.foreign_key_columns fkc
+                        JOIN sys.columns c ON fkc.parent_object_id = c.object_id AND fkc.parent_column_id = c.column_id
+                        JOIN sys.tables t ON fkc.referenced_object_id = t.object_id
+                        WHERE OBJECT_NAME(fkc.parent_object_id) = 'machines'
+                        AND c.name = 'subSectionId'
+                        AND t.name = 'lines';
+
+                        -- Drop the incorrect constraint
+                        IF @ConstraintName IS NOT NULL
+                        BEGIN
+                            EXEC('ALTER TABLE machines DROP CONSTRAINT ' + @ConstraintName);
+                        END
+                    END
+                `);
+
+                // Add the correct constraint if it doesn't exist
+                await executeQuery(`
+                    IF NOT EXISTS (
+                        SELECT *
+                        FROM sys.foreign_keys
+                        WHERE name = 'FK_Machines_SubSections' AND parent_object_id = OBJECT_ID('machines')
+                    )
+                    BEGIN
+                        ALTER TABLE machines
+                        ADD CONSTRAINT FK_Machines_SubSections FOREIGN KEY (subSectionId) REFERENCES sub_sections(id) ON DELETE CASCADE;
+                    END
+                `);
+            }
+
+            if (!await migrationHelper.tableExists('machine_assignments')) {
+                await executeQuery(`
+                    CREATE TABLE machine_assignments (
+                        id INT IDENTITY(1,1) PRIMARY KEY,
+                        machine_id INT NOT NULL,
+                        user_id INT NOT NULL,
+                        assigned_by INT,
+                        assigned_at DATETIME DEFAULT GETDATE(),
+                        CONSTRAINT unique_machine_user UNIQUE (machine_id, user_id)
+                    )
+                `);
+                await migrationHelper.ensureIndexExists('machine_assignments', 'idx_machine', 'CREATE INDEX idx_machine ON machine_assignments(machine_id)');
+                await migrationHelper.ensureIndexExists('machine_assignments', 'idx_user', 'CREATE INDEX idx_user ON machine_assignments(user_id)');
+            }
+
+            // Backfill for databases where [machines] was created before these indexes existed
+            // (they were previously only added inside the CREATE TABLE branch above). Without
+            // idx_line, the correlated EXISTS join in section.model.js's sectionCountSql falls
+            // back to a full scan of machines per section per matching user, making section
+            // list/detail fetches crawl.
+            await migrationHelper.ensureIndexExists('machines', 'idx_line', 'CREATE INDEX idx_line ON machines(line)');
+            await migrationHelper.ensureIndexExists('machines', 'idx_subsection', 'CREATE INDEX idx_subsection ON machines(subSectionId)');
+
+            // Same backfill for machine_assignments: idx_machine/idx_user were previously only
+            // added inside the CREATE TABLE branch above, so databases where the table already
+            // existed never got them. Without idx_user, the EXISTS correlated subquery in
+            // sectionCountSql/lineCountSql/etc. does a full scan of machine_assignments for
+            // every user row it checks.
+            await migrationHelper.ensureIndexExists('machine_assignments', 'idx_machine', 'CREATE INDEX idx_machine ON machine_assignments(machine_id)');
+            await migrationHelper.ensureIndexExists('machine_assignments', 'idx_user', 'CREATE INDEX idx_user ON machine_assignments(user_id)');
+
+            logger.info("Machine tables initialized successfully");
+        } catch (error) {
+            logger.error("Failed to initialize Machine tables", error);
+        }
+    }
+
+    static async create(data) {
+        const machine = new Machine(data);
+
+        const fields = [
+            "name", "line", "subSectionId", "description", "criticality", "isActive", "createdAt"
+        ];
+
+        if (!machine.createdAt) machine.createdAt = new Date();
+
+        const values = fields.map(field => {
+            const val = machine[field];
+            if (val === undefined) return null;
+            return val;
+        });
+
+        const placeholders = fields.map(() => "?").join(",");
+        const query = `INSERT INTO machines (${fields.join(",")}) 
+        OUTPUT INSERTED.id
+        VALUES (${placeholders})`;
+
+        const [result] = await executeQuery(query, values);
+        return Machine.findById(result[0].id);
+    }
+
+    static async findById(id) {
+        const query = `
+            SELECT m.*,
+            ${machineCountSql("m")}
+            FROM machines m
+            WHERE m.id = ?`;
+        const [rows] = await executeQuery(query, [id]);
+        if (rows.length === 0) return null;
+        return new Machine(rows[0]);
+    }
+
+    static async findOne(query) {
+        const keys = Object.keys(query).filter(key => query[key] !== undefined);
+        if (keys.length === 0) return null;
+
+        const whereClause = keys.map(key => `${key} = ?`).join(" AND ");
+        const values = keys.map(key => query[key]);
+
+        const [rows] = await executeQuery(`SELECT TOP 1 * FROM machines WHERE ${whereClause}`, values);
+        if (rows.length === 0) return null;
+        return new Machine(rows[0]);
+    }
+
+    static async find(query = {}) {
+        const keys = Object.keys(query).filter(key => query[key] !== undefined);
+        let sql = `
+            SELECT m.*,
+            ${machineCountSql("m")}
+            FROM machines m`;
+        let values = [];
+
+        if (keys.length > 0) {
+            const whereClause = keys.map(key => `${key} = ?`).join(" AND ");
+            sql += ` WHERE ${whereClause}`;
+            values = keys.map(key => query[key]);
+        }
+
+        const [rows] = await executeQuery(sql, values);
+        return rows.map(row => new Machine(row));
+    }
+
+    static async countDocuments(query = {}) {
+        const keys = Object.keys(query).filter(key => query[key] !== undefined);
+        let sql = "SELECT COUNT(*) as count FROM machines";
+        let values = [];
+
+        if (keys.length > 0) {
+            const whereClause = keys.map(key => `${key} = ?`).join(" AND ");
+            sql += ` WHERE ${whereClause}`;
+            values = keys.map(key => query[key]);
+        }
+
+        const [rows] = await executeQuery(sql, values);
+        return rows[0].count;
+    }
+
+    async save() {
+        const fields = [
+            "name", "line", "subSectionId", "description", "criticality", "isActive"
+        ];
+
+        const setClause = fields.map(field => `${field} = ?`).join(", ");
+        const values = fields.map(field => this[field]);
+        values.push(this.id);
+
+        await executeQuery(`UPDATE machines SET ${setClause}, updatedAt = GETDATE() WHERE id = ?`, values);
+        return this;
+    }
+}
+
+// Initialize table
+// Machine.init();
+
+export default Machine;

@@ -1,0 +1,137 @@
+import { executeQuery } from "../db/mssqlHelper.js";
+import migrationHelper from "../db/migrationHelper.js";
+import logger from "../logger/winston.logger.js";
+
+class EmailConfiguration {
+    constructor(data) {
+        this.id = data.id;
+        this.formName = data.formName;
+        this.departmentId = data.departmentId;
+        this.sectionId = data.sectionId;
+        this.toEmails = data.toEmails;
+        this.ccEmails = data.ccEmails;
+        this.includeTrainer = data.includeTrainer !== undefined ? !!data.includeTrainer : false;
+        this.isActive = data.isActive !== undefined ? !!data.isActive : true;
+        this.scheduledTime = data.scheduledTime || null;
+        this.createdAt = data.createdAt;
+        this.updatedAt = data.updatedAt;
+    }
+
+    static async init() {
+        try {
+            if (!await migrationHelper.tableExists('email_configurations')) {
+                await executeQuery(`
+                    CREATE TABLE email_configurations (
+                      id INT IDENTITY(1,1) PRIMARY KEY,
+                      formName VARCHAR(150) NOT NULL,
+                      departmentId INT NULL,
+                      sectionId INT NULL,
+                      toEmails NVARCHAR(MAX),
+                      ccEmails NVARCHAR(MAX),
+                      includeTrainer BIT DEFAULT 0,
+                      isActive BIT DEFAULT 1,
+                      createdAt DATETIME DEFAULT GETDATE(),
+                      updatedAt DATETIME DEFAULT GETDATE(),
+                      CONSTRAINT fk_email_config_dept FOREIGN KEY (departmentId) REFERENCES departments(id) ON DELETE CASCADE,
+                      CONSTRAINT fk_email_config_sec FOREIGN KEY (sectionId) REFERENCES sections(id) ON DELETE NO ACTION
+                    )
+                `);
+            }
+            // Auto-migration for missing columns
+            await migrationHelper.ensureColumnExists('email_configurations', 'includeTrainer', 'BIT DEFAULT 0');
+            await migrationHelper.ensureColumnExists('email_configurations', 'sectionId', 'INT NULL');
+            await migrationHelper.ensureColumnExists('email_configurations', 'scheduledTime', 'VARCHAR(5) NULL');
+        } catch (error) {
+            logger.error("Failed to initialize email_configurations table", error);
+        }
+    }
+
+    static async create(data) {
+        const { formName, departmentId, sectionId, toEmails, ccEmails, includeTrainer, isActive, scheduledTime } = data;
+        const active = isActive !== undefined ? (isActive ? 1 : 0) : 1;
+        const trainer = includeTrainer !== undefined ? (includeTrainer ? 1 : 0) : 0;
+
+        const query = `
+      INSERT INTO email_configurations (formName, departmentId, sectionId, toEmails, ccEmails, includeTrainer, isActive, scheduledTime, updatedAt)
+      OUTPUT INSERTED.*
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, GETDATE())
+    `;
+
+        const [rows] = await executeQuery(query, [formName, departmentId || null, sectionId || null, toEmails, ccEmails, trainer, active, scheduledTime || null]);
+        return new EmailConfiguration(rows[0]);
+    }
+
+    static async findByFormDeptAndSection(formName, departmentId, sectionId) {
+        const query = `
+      SELECT * FROM email_configurations 
+      WHERE formName = ? 
+      AND (
+        (sectionId = ? AND departmentId = ?) OR 
+        (sectionId IS NULL AND departmentId = ?) OR 
+        (sectionId IS NULL AND departmentId IS NULL)
+      ) 
+      AND isActive = 1
+      ORDER BY sectionId DESC, departmentId DESC
+    `;
+        const [rows] = await executeQuery(query, [formName, sectionId, departmentId, departmentId]);
+        if (rows.length === 0) return null;
+        return new EmailConfiguration(rows[0]);
+    }
+
+    static async findAll() {
+        const query = `
+      SELECT ec.*, d.name as departmentName, s.name as sectionName
+      FROM email_configurations ec
+      LEFT JOIN departments d ON ec.departmentId = d.id
+      LEFT JOIN sections s ON ec.sectionId = s.id
+      ORDER BY ec.formName ASC
+    `;
+        const [rows] = await executeQuery(query);
+        return rows.map(row => ({
+            ...new EmailConfiguration(row),
+            departmentName: row.departmentName,
+            sectionName: row.sectionName
+        }));
+    }
+
+    static async findById(id) {
+        const query = `SELECT * FROM email_configurations WHERE id = ?`;
+        const [rows] = await executeQuery(query, [id]);
+        if (rows.length === 0) return null;
+        return new EmailConfiguration(rows[0]);
+    }
+
+    static async update(id, data) {
+        const fields = [];
+        const values = [];
+
+        if (data.formName !== undefined) { fields.push("formName = ?"); values.push(data.formName); }
+        if (data.departmentId !== undefined) { fields.push("departmentId = ?"); values.push(data.departmentId || null); }
+        if (data.sectionId !== undefined) { fields.push("sectionId = ?"); values.push(data.sectionId || null); }
+        if (data.toEmails !== undefined) { fields.push("toEmails = ?"); values.push(data.toEmails); }
+        if (data.ccEmails !== undefined) { fields.push("ccEmails = ?"); values.push(data.ccEmails); }
+        if (data.includeTrainer !== undefined) { fields.push("includeTrainer = ?"); values.push(data.includeTrainer ? 1 : 0); }
+        if (data.isActive !== undefined) { fields.push("isActive = ?"); values.push(data.isActive ? 1 : 0); }
+        if (data.scheduledTime !== undefined) { fields.push("scheduledTime = ?"); values.push(data.scheduledTime || null); }
+
+        if (fields.length === 0) return null;
+
+        fields.push("updatedAt = GETDATE()");
+        const query = `UPDATE email_configurations SET ${fields.join(", ")} WHERE id = ?`;
+        values.push(id);
+
+        await executeQuery(query, values);
+        return this.findById(id);
+    }
+
+    static async delete(id) {
+        const query = `DELETE FROM email_configurations WHERE id = ?`;
+        await executeQuery(query, [id]);
+        return true;
+    }
+}
+
+// Initialize
+EmailConfiguration.init();
+
+export default EmailConfiguration;
